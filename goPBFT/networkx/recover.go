@@ -2,6 +2,8 @@ package networkx
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"encoding/gob"
 	"log"
 	"../datastruc"
@@ -10,6 +12,7 @@ import (
 type QueryForBlockMsg struct {
 	Localheight int
 	Pubkey string
+	Sig PariSign
 }
 
 type ReplyForQueryMsg struct {
@@ -18,20 +21,21 @@ type ReplyForQueryMsg struct {
 	ViewList []int
 	RequestList []int
 	Pubkey string
+	Sig PariSign
 }
 
-func NewQueryLostDataMsg(pubkey string, localheigh int) QueryForBlockMsg {
+func NewQueryLostDataMsg(pubkey string, localheigh int, prvkey *ecdsa.PrivateKey) QueryForBlockMsg {
 	qforb := QueryForBlockMsg{}
 	qforb.Localheight = localheigh
 	qforb.Pubkey = pubkey
+	datatosign := string(qforb.Localheight)
+	qforb.Sig.Sign([]byte(datatosign), prvkey)
 	return qforb
 }
 
+func ReplyLost(pubkey string, localheight int, queryheigh int, remoteaddr string, viewlist []int, requestlist []int, prvkey *ecdsa.PrivateKey) {
 
-
-func ReplyLost(pubkey string, localheight int, queryheigh int, remoteaddr string, viewlist []int, requestlist []int) {
-
-	newrfq := NewReplyForQuery(pubkey, localheight, queryheigh, viewlist, requestlist)
+	newrfq := NewReplyForQuery(pubkey, localheight, queryheigh, viewlist, requestlist, prvkey)
 	var buff bytes.Buffer
 	enc := gob.NewEncoder(&buff)
 	err := enc.Encode(newrfq)
@@ -45,17 +49,31 @@ func ReplyLost(pubkey string, localheight int, queryheigh int, remoteaddr string
 	//fmt.Println(extractNodeID(pbft.nodeIPAddress), "has finished reply msg sending to", remoteaddr)
 }
 
-func NewReplyForQuery(pubkey string, localheight int, queryheigh int, viewlist []int, requestlist []int) ReplyForQueryMsg {
+func NewReplyForQuery(pubkey string, localheight int, queryheigh int, viewlist []int, requestlist []int, prvkey *ecdsa.PrivateKey) ReplyForQueryMsg {
 	rforq := ReplyForQueryMsg{}
 	rforq.Height = queryheigh
 	rforq.RequestNum = localheight - queryheigh
 	rforq.ViewList = viewlist
 	rforq.RequestList = requestlist
+
+	datatosign := rforq.Serialize()
+	rforq.Sig.Sign([]byte(datatosign), prvkey)
 	rforq.Pubkey = pubkey
 	return rforq
 }
 
+func (rforq ReplyForQueryMsg) Serialize() []byte {
+	var encoded bytes.Buffer
 
+	gob.Register(elliptic.P256())
+	enc := gob.NewEncoder(&encoded)
+	err := enc.Encode(rforq)
+	if err != nil {
+		log.Panic(err)
+	}
+
+	return encoded.Bytes()
+}
 
 func ExtractSenderIp(curConfigure []datastruc.PeerIdentity, sendAccount string) string {
 	var senderip string

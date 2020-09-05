@@ -13,6 +13,6 @@ func main() {
 		go pbftinstance.Initialize()
 	}
 
-	time.Sleep(300*time.Second)
+	time.Sleep(200*time.Second)
 	fmt.Println("main finished")
 }

@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	crand "crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/gob"
 	"encoding/pem"
@@ -53,13 +54,16 @@ type PBFT struct {
 	mu sync.Mutex
 
 	nodeIPAddress       string
-	nodePubKey string
+	nodePubKey *ecdsa.PublicKey
+	nodePrvKey *ecdsa.PrivateKey
+	nodePubkeystr string
+	nodePrvkeystr string
 	minerIPAddress      []string
 	minerPubKey         []string
 
 	status int
 	consenstatus int
-	curleaderPubKey string
+	curleaderPubKeystr string
 	curleaderIpAddr string
 
 	prepreparedCh chan progres
@@ -123,13 +127,12 @@ func bytesToCommand(bytees []byte) string {
 func MakePeer(addr string, memb []string) *PBFT {
 	pbft := &PBFT{}
 	pbft.nodeIPAddress = addr
-	pbft.nodePubKey = ""
 	pbft.minerIPAddress = memb
 	pbft.minerPubKey = []string{}
 
 	pbft.status = stat_consensus
 	pbft.consenstatus = Unstarted
-	pbft.curleaderPubKey = ""
+	pbft.curleaderPubKeystr = ""
 
 	pbft.viewnumber = 0
 	pbft.currentHeight = 0
@@ -160,7 +163,7 @@ func MakePeer(addr string, memb []string) *PBFT {
 	pbft.persis.requestlist = make(map[int]int)
 
 	pbft.generatePubKeys()
-	constructConfigure(&pbft.curConfigure, datastruc.PeerIdentity{pbft.nodePubKey, pbft.nodeIPAddress})
+	constructConfigure(&pbft.curConfigure, datastruc.PeerIdentity{pbft.nodePubkeystr, pbft.nodeIPAddress})
 
 	return pbft
 }
@@ -185,13 +188,13 @@ RECOVERSTART:
 		switch pbft.status {
 		case stat_consensus:
 			fmt.Print("node ", extractNodeID(pbft.nodeIPAddress)," now enters consensus stage in view ",pbft.viewnumber," in height ", pbft.currentHeight, "\n")
-			if pbft.nodePubKey==pbft.curleaderPubKey {
+			if pbft.nodePubkeystr==pbft.curleaderPubKeystr {
 				time.Sleep(2000*time.Millisecond)
 				if pbft.hasRemainBInNVMsg==false {
-					condi := pbft.currentHeight>=6 && pbft.currentHeight%8==0 && (pbft.currentHeight/(pbft.viewnumber+1))==8
+					condi := pbft.currentHeight>=1116 && pbft.currentHeight%8==0 && (pbft.currentHeight/(pbft.viewnumber+1))==8
 					if condi==false {
 						fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "is leader, now broadcasts pre-prepare msg")
-						go pbft.broadcastPreprepare(pbft.viewnumber, pbft.currentHeight)
+						go pbft.broadcastPreprepare(pbft.viewnumber, pbft.currentHeight, pbft.nodePrvKey)
 					} else {
 						fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "is leader, launches silence attack, does not broadcast pre-prepare msg")
 					}
@@ -204,7 +207,7 @@ RECOVERSTART:
 		consensus_loop:
 			for {
 				if pbft.consenstatus==Unstarted {
-					go pbft.scanPreprepare(pbft.viewnumber, pbft.currentHeight, pbft.curleaderPubKey)
+					go pbft.scanPreprepare(pbft.viewnumber, pbft.currentHeight, pbft.curleaderPubKeystr)
 					condi := extractNodeID(pbft.nodeIPAddress)==13 && pbft.viewnumber==0 && pbft.currentHeight==5
 					if condi {
 						fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "scan Pre-prepare in view ",pbft.viewnumber," height ", pbft.currentHeight)
@@ -239,8 +242,8 @@ RECOVERSTART:
 					if prog.view==pbft.viewnumber && prog.height==pbft.currentHeight && pbft.consenstatus==Unstarted {
 						pbft.consenstatus = Preprepared
 						//fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "is pre-prepared in view ", pbft.viewnumber, " height ", pbft.currentHeight)
-						go pbft.broadcastPrepare(pbft.viewnumber, pbft.currentHeight)
-						go pbft.scanPrepare(pbft.viewnumber, pbft.currentHeight)
+						go pbft.broadcastPrepare(pbft.viewnumber, pbft.currentHeight, pbft.currequest)
+						go pbft.scanPrepare(pbft.viewnumber, pbft.currentHeight, pbft.currequest)
 					}
 					pbft.mu.Unlock()
 				case prog :=<- pbft.preparedCh:
@@ -249,12 +252,12 @@ RECOVERSTART:
 						pbft.consenstatus = Prepared
 						pbft.persis.preparedheight = pbft.currentHeight
 						fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "is prepared in view ", pbft.viewnumber, " height ", pbft.currentHeight)
-						go pbft.broadcastCommit(pbft.viewnumber, pbft.currentHeight)
-						go pbft.scanCommit(pbft.viewnumber, pbft.currentHeight)
+						go pbft.broadcastCommit(pbft.viewnumber, pbft.currentHeight, pbft.currequest)
+						go pbft.scanCommit(pbft.viewnumber, pbft.currentHeight, pbft.currequest)
 					}
 					pbft.mu.Unlock()
 				case prog :=<- pbft.committedCh:
-					condi := extractNodeID(pbft.nodeIPAddress)==13 && pbft.currentHeight>=7 && pbft.currentHeight%7==0 && pbft.nodePubKey!=pbft.curleaderPubKey
+					condi := extractNodeID(pbft.nodeIPAddress)==13 && pbft.currentHeight==7 && pbft.nodePubkeystr!=pbft.curleaderPubKeystr
 					if condi {
 						fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "sleeps when committing in height", pbft.currentHeight)
 						time.Sleep(time.Second*ConsensusTimer)
@@ -291,7 +294,7 @@ RECOVERSTART:
 			}
 		case stat_inaugurate:
 			fmt.Print("node ", extractNodeID(pbft.nodeIPAddress)," now enters inauguration stage in view ", pbft.viewnumber," in height ", pbft.currentHeight, "\n")
-			if pbft.nodePubKey==pbft.curleaderPubKey && pbft.sentnewviewmsg[pbft.viewnumber]==false {
+			if pbft.nodePubkeystr==pbft.curleaderPubKeystr && pbft.sentnewviewmsg[pbft.viewnumber]==false {
 				pbft.sentnewviewmsg[pbft.viewnumber] = true
 				pbft.mu.Lock()
 				view := pbft.viewnumber
@@ -301,7 +304,7 @@ RECOVERSTART:
 			}
 			pbft.mu.Lock()
 			ckp := pbft.persis.commitedheight
-			leaderpubkey := pbft.curleaderPubKey
+			leaderpubkey := pbft.curleaderPubKeystr
 			pbft.mu.Unlock()
 			go pbft.scanNewView(pbft.viewnumber, ckp, leaderpubkey)
 			thetimer := time.NewTimer(time.Second*InauguratTimer)
@@ -369,7 +372,7 @@ func (pbft *PBFT) scanViewChange(view int) {
 
 func (pbft *PBFT) CommitCurConsensOb() {
 	// do not re-execute requests
-	condi := extractNodeID(pbft.nodeIPAddress)==13 && pbft.currentHeight>=5 && pbft.currentHeight<=5 && pbft.nodePubKey!=pbft.curleaderPubKey
+	condi := extractNodeID(pbft.nodeIPAddress)==13 && pbft.currentHeight>=5 && pbft.currentHeight<=5 && pbft.nodePubkeystr!=pbft.curleaderPubKeystr
 	if condi==false {
 		// reset consensus variables and channels
 		pbft.persis.requestlist[pbft.currentHeight] = pbft.currequest
@@ -397,7 +400,7 @@ func (pbft *PBFT) resetVariForViewChange() {
 	pbft.viewnumber += 1
 	// consensus status change?
 	pbft.succLine.RotateLeader()
-	pbft.curleaderPubKey = pbft.succLine.CurLeader.Member.PubKey
+	pbft.curleaderPubKeystr = pbft.succLine.CurLeader.Member.PubKey
 	pbft.curleaderIpAddr = pbft.succLine.CurLeader.Member.IpAddr
 	pbft.hasRemainBInNVMsg = false
 }
@@ -418,7 +421,7 @@ func (pbft *PBFT) scanPreprepare(view, heigh int, leaderpubkey string) {
 				pbft.mu.Unlock()
 				theview := thepreprepare.View
 				if view==theview && thepreprepare.Pubkey==leaderpubkey {
-					pbft.currequest = thepreprepare.Request
+					pbft.currequest = thepreprepare.Digest
 					prog := progres{view, heigh}
 					pbft.prepreparedCh<-prog
 					return
@@ -430,7 +433,7 @@ func (pbft *PBFT) scanPreprepare(view, heigh int, leaderpubkey string) {
 	}
 }
 
-func (pbft *PBFT) scanPrepare(view, heigh int) {
+func (pbft *PBFT) scanPrepare(view, heigh int, digest int) {
 	timeouter := time.NewTimer(time.Millisecond*ThreadExit)
 	for {
 		select {
@@ -438,9 +441,14 @@ func (pbft *PBFT) scanPrepare(view, heigh int) {
 			return
 		default:
 			pbft.mu.Lock()
-			le := len(pbft.prepareVote[heigh])
+			acc := 0
+			for _, vote := range pbft.prepareVote[heigh] {
+				if digest==vote.Digest {
+					acc += 1
+				}
+			}
 			pbft.mu.Unlock()
-			if le>=QuorumSize {
+			if acc>=QuorumSize {
 				prog := progres{view, heigh}
 				pbft.preparedCh<-prog
 				return
@@ -451,7 +459,7 @@ func (pbft *PBFT) scanPrepare(view, heigh int) {
 	}
 }
 
-func (pbft *PBFT) scanCommit(view, heigh int) {
+func (pbft *PBFT) scanCommit(view, heigh int, digest int) {
 	timeouter := time.NewTimer(time.Millisecond*ThreadExit)
 	for {
 		select {
@@ -459,22 +467,26 @@ func (pbft *PBFT) scanCommit(view, heigh int) {
 			return
 		default:
 			pbft.mu.Lock()
-			le := len(pbft.commitVote[heigh])
+			acc := 0
+			for _, vote := range pbft.commitVote[heigh] {
+				if digest==vote.Digest {
+					acc += 1
+				}
+			}
 			pbft.mu.Unlock()
-			if le>=QuorumSize {
+			if acc>=QuorumSize {
 				prog := progres{view, heigh}
 				pbft.committedCh<-prog
 				return
 			} else {
 				time.Sleep(time.Millisecond*ScanInterval)
 			}
-
 		}
 	}
 }
 
-func (pbft *PBFT) broadcastPrepare(v, n int) {
-	preparemsg := NewPrepareMsg(v, n, pbft.nodePubKey)
+func (pbft *PBFT) broadcastPrepare(v, n , digest int) {
+	preparemsg := NewPrepareMsg(v, n, digest, pbft.nodePubkeystr, pbft.nodePrvKey)
 	for _, dest := range pbft.minerIPAddress {
 		if dest == pbft.nodeIPAddress {
 			pbft.mu.Lock()
@@ -551,7 +563,7 @@ func (pbft *PBFT) runServer() {
 func (pbft *PBFT) broadcastAddrPubKeyIp() {
 	for _, dest := range pbft.minerIPAddress {
 		if dest != pbft.nodeIPAddress {
-			peerid := datastruc.PeerIdentity{pbft.nodePubKey, pbft.nodeIPAddress}
+			peerid := datastruc.PeerIdentity{pbft.nodePubkeystr, pbft.nodeIPAddress}
 			go SendAddrPubKey(peerid, dest)
 		}
 	}
@@ -586,14 +598,14 @@ func (pbft *PBFT) handleAddrPubKey(conten []byte) {
 
 	if len(pbft.curConfigure)==TotalNumber {
 		pbft.succLine = datastruc.ConstructSuccessionLine(pbft.curConfigure)
-		pbft.curleaderPubKey = pbft.succLine.CurLeader.Member.PubKey
+		pbft.curleaderPubKeystr = pbft.succLine.CurLeader.Member.PubKey
 		pbft.curleaderIpAddr = pbft.succLine.CurLeader.Member.IpAddr
 		fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "thinks the current leader should be ", pbft.curleaderIpAddr)
 	}
 }
 
-func (pbft *PBFT) broadcastPreprepare(v, n int) {
-	prepreparemsg := NewPreprepareMsg(v, n, pbft.nodePubKey)
+func (pbft *PBFT) broadcastPreprepare(v, n int, prk *ecdsa.PrivateKey) {
+	prepreparemsg := NewPreprepareMsg(v, n, pbft.nodePubkeystr, prk)
 	var buff bytes.Buffer
 	enc := gob.NewEncoder(&buff)
 	err := enc.Encode(prepreparemsg)
@@ -643,7 +655,15 @@ func (pbft *PBFT) handlePreprepareMsg(content []byte) {
 		fmt.Println("decoding error")
 	}
 
-	//if prepreparemsg.Pubkey!=pbft.curleaderPubKey {
+	// verify signature
+	datatoverify := string(prepreparemsg.View) + "," + string(prepreparemsg.Order) + "," + string(prepreparemsg.Digest)
+	pub := DecodePublic(prepreparemsg.Pubkey)
+	if !prepreparemsg.Sig.Verify([]byte(datatoverify), pub) {
+		fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "received pre-preparemsg in height ", prepreparemsg.Order, " but the sig is wrong!")
+		return
+	}
+
+	//if prepreparemsg.Pubkey!=pbft.curleaderPubKeystr {
 	//	fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "receives a pre-prepare msg, but it is not from leader")
 	//}
 
@@ -651,7 +671,7 @@ func (pbft *PBFT) handlePreprepareMsg(content []byte) {
 	localheigh := pbft.persis.commitedheight
 	if localheigh+1<prepreparemsg.Order {
 		fmt.Println("node", extractNodeID(pbft.nodeIPAddress), " realizes it has been left behind after receiving pre-prepare msg, query lost data, current height: ", localheigh, "system height: ", prepreparemsg.Order)
-		go QueryLostData(pbft.nodePubKey, pbft.curleaderIpAddr, localheigh)
+		go QueryLostData(pbft.nodePubkeystr, pbft.curleaderIpAddr, localheigh, pbft.nodePrvKey)
 		//fmt.Println("node", extractNodeID(pbft.nodeIPAddress), " realizes it has been left behind after receiving pre-prepare msg, " +
 		//	"but doesn't query lost data, current height: ", localheigh, " system height: ", prepreparemsg.Order)
 	}
@@ -661,8 +681,8 @@ func (pbft *PBFT) handlePreprepareMsg(content []byte) {
 	fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "received pre-preparemsg in height ", prepreparemsg.Order)
 }
 
-func QueryLostData(pubkey string, remoteaddr string, localheigh int) {
-	querymsg := NewQueryLostDataMsg(pubkey, localheigh)
+func QueryLostData(pubkey string, remoteaddr string, localheigh int, prvkey *ecdsa.PrivateKey) {
+	querymsg := NewQueryLostDataMsg(pubkey, localheigh, prvkey)
 
 	var buff bytes.Buffer
 	enc := gob.NewEncoder(&buff)
@@ -687,13 +707,21 @@ func (pbft *PBFT) handlePrepareMsg(content []byte) {
 		fmt.Println("decoding error")
 		log.Panic(err)
 	}
+
+	datatoverify := string(preparemsg.View) + "," + string(preparemsg.Order) + "," + string(preparemsg.Digest)
+	pub := DecodePublic(preparemsg.Pubkey)
+	if !preparemsg.Sig.Verify([]byte(datatoverify), pub) {
+		fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "received preparemsg in height ", preparemsg.Order, " but the sig is wrong!")
+		return
+	}
+
 	pbft.mu.Lock()
 	pbft.prepareVote[preparemsg.Order] = append(pbft.prepareVote[preparemsg.Order], preparemsg)
 	pbft.mu.Unlock()
 }
 
-func (pbft *PBFT) broadcastCommit(v, n int) {
-	commitmsg := NewCommitMsg(v, n, pbft.nodePubKey)
+func (pbft *PBFT) broadcastCommit(v, n int, digest int) {
+	commitmsg := NewCommitMsg(v, n, digest, pbft.nodePubkeystr, pbft.nodePrvKey)
 	for _, dest := range pbft.minerIPAddress {
 		if dest == pbft.nodeIPAddress {
 			pbft.mu.Lock()
@@ -726,13 +754,20 @@ func (pbft *PBFT) handleCommitMsg(content []byte) {
 		fmt.Println("decoding error")
 	}
 
+	datatoverify := string(commitmsg.View) + "," + string(commitmsg.Order) + "," + string(commitmsg.Digest)
+	pub := DecodePublic(commitmsg.Pubkey)
+	if !commitmsg.Sig.Verify([]byte(datatoverify), pub) {
+		fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "received commitmsg in height ", commitmsg.Order, " but the sig is wrong!")
+		return
+	}
+
 	pbft.mu.Lock()
 	pbft.commitVote[commitmsg.Order] = append(pbft.commitVote[commitmsg.Order], commitmsg)
 	pbft.mu.Unlock()
 }
 
 func (pbft *PBFT) broadcastViewChange(view, ckpheigh, lockheigh int) {
-	vcmsg := NewViewChangeMsg(view, pbft.nodePubKey, ckpheigh, lockheigh)
+	vcmsg := NewViewChangeMsg(view, pbft.nodePubkeystr, ckpheigh, lockheigh, pbft.nodePrvKey)
 	for _, dest := range pbft.minerIPAddress {
 		if dest == pbft.nodeIPAddress {
 			pbft.mu.Lock()
@@ -764,6 +799,13 @@ func (pbft *PBFT) handleViewChangeMsg (conten []byte) {
 		log.Panic(err)
 	}
 
+	datatoverify := string(vcmsg.View) + "," + vcmsg.Pubkey + "," + string(vcmsg.LastBHeight) + "," + string(vcmsg.LockedHeight)
+	pub := DecodePublic(vcmsg.Pubkey)
+	if !vcmsg.Sig.Verify([]byte(datatoverify), pub) {
+		fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "received commitmsg in view ", vcmsg.View, " but the sig is wrong!")
+		return
+	}
+
 	pbft.mu.Lock()
 	localheigh := pbft.persis.commitedheight
 	if localheigh<vcmsg.LastBHeight {
@@ -771,7 +813,7 @@ func (pbft *PBFT) handleViewChangeMsg (conten []byte) {
 		remoteaddr := ExtractSenderIp(pbft.curConfigure, remotepubkey)
 		fmt.Println("node", extractNodeID(pbft.nodeIPAddress), " realizes it has been left behind after receiving view change msg, query lost data," +
 			" current height: ", localheigh, "system height: ", vcmsg.LastBHeight)
-		go QueryLostData(pbft.nodePubKey, remoteaddr, localheigh)
+		go QueryLostData(pbft.nodePubkeystr, remoteaddr, localheigh, pbft.nodePrvKey)
 	}
 	pbft.vcmsgset[vcmsg.View] = append(pbft.vcmsgset[vcmsg.View], vcmsg)
 	pbft.mu.Unlock()
@@ -779,7 +821,7 @@ func (pbft *PBFT) handleViewChangeMsg (conten []byte) {
 }
 
 func (pbft *PBFT) broadcastNewView(view int, vcset []ViewChangeMsg) {
-	nvmsg := NewNewViewMsg(view, pbft.nodePubKey, vcset)
+	nvmsg := NewNewViewMsg(view, pbft.nodePubkeystr, vcset, pbft.nodePrvKey)
 	if len(nvmsg.PPMsgSet)>0 {
 		order := nvmsg.PPMsgSet[0].Order
 		fmt.Println("leader", extractNodeID(pbft.nodeIPAddress), "now broadcasts new-view msg, with a pre-prepare msg of height", order)
@@ -818,6 +860,16 @@ func (pbft *PBFT) handleNewViewMsg(conten []byte) {
 		log.Panic(err)
 	}
 
+	nvvmsg := nvmsg
+	nvvmsg.Sig = PariSign{}
+	nvvmsg.Pubkey = ""
+	datatoverify := sha256.Sum256(nvvmsg.Serialize())
+	pub := DecodePublic(nvmsg.Pubkey)
+	if !nvmsg.Sig.Verify(datatoverify[:], pub) {
+		fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "received new-view msg in view ", nvmsg.View, " but the sig is wrong!")
+		return
+	}
+
 	// start consens the request prepared in the new-view msg
 	pbft.mu.Lock()
 	pbft.newviewlog[nvmsg.View] = nvmsg
@@ -836,6 +888,15 @@ func (pbft *PBFT) handleQueryLost(content []byte) {
 	if err!=nil {
 		log.Panic(err)
 	}
+
+	// verify signature
+	datatosign := string(qlmsg.Localheight)
+	pub := DecodePublic(qlmsg.Pubkey)
+	if !qlmsg.Sig.Verify([]byte(datatosign), pub) {
+		fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "received query for lost msg in height ", qlmsg.Localheight, " but the sig is wrong!")
+		return
+	}
+
 	pbft.mu.Lock()
 	localheigh := pbft.persis.commitedheight
 	if qlmsg.Localheight<localheigh {
@@ -849,7 +910,7 @@ func (pbft *PBFT) handleQueryLost(content []byte) {
 			requestlist = append(requestlist, pbft.persis.requestlist[i])
 		}
 		fmt.Println("------", viewlist, "------")
-		go ReplyLost(pbft.nodePubKey, localheigh, qlmsg.Localheight, remoteaddr, viewlist, requestlist)
+		go ReplyLost(pbft.nodePubkeystr, localheigh, qlmsg.Localheight, remoteaddr, viewlist, requestlist, pbft.nodePrvKey)
 	} else {
 		fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "doesn't reply querier because it is also left behind")
 	}
@@ -866,6 +927,17 @@ func (pbft *PBFT) handleReplyLost(content []byte) {
 	if err != nil {
 		fmt.Println("decoding error")
 	}
+	// verify signature
+	rfqqmsg := rfqmsg
+	rfqqmsg.Sig = PariSign{}
+	rfqqmsg.Pubkey = ""
+	datatoverify := rfqqmsg.Serialize()
+	pub := DecodePublic(rfqmsg.Pubkey)
+	if !rfqmsg.Sig.Verify(datatoverify, pub) {
+		fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "received reply for query msg in height ", rfqmsg.Height, " but the sig is wrong!")
+		return
+	}
+
 	fmt.Println("node", extractNodeID(pbft.nodeIPAddress), " received a replylost from height ", (rfqmsg.Height+1), " to ", (rfqmsg.Height + rfqmsg.RequestNum))
 	// TODO, querier updates its state to the newest after receiving the lost data
 	pbft.mu.Lock()
@@ -878,7 +950,7 @@ func (pbft *PBFT) handleReplyLost(content []byte) {
 		if pbft.viewnumber > pbft.recovStartView {
 			for j:=0; j<pbft.viewnumber - pbft.recovStartView; j++ {
 				pbft.succLine.InverseRotateLeader()
-				pbft.curleaderPubKey = pbft.succLine.CurLeader.Member.PubKey
+				pbft.curleaderPubKeystr = pbft.succLine.CurLeader.Member.PubKey
 				pbft.curleaderIpAddr = pbft.succLine.CurLeader.Member.IpAddr
 			}
 			pbft.viewnumber = pbft.recovStartView
@@ -889,7 +961,7 @@ func (pbft *PBFT) handleReplyLost(content []byte) {
 			if rfqmsg.ViewList[i] > pbft.viewnumber {
 				for j:=0; j<(rfqmsg.ViewList[i]-pbft.viewnumber); j++ {
 					pbft.succLine.RotateLeader()
-					pbft.curleaderPubKey = pbft.succLine.CurLeader.Member.PubKey
+					pbft.curleaderPubKeystr = pbft.succLine.CurLeader.Member.PubKey
 					pbft.curleaderIpAddr = pbft.succLine.CurLeader.Member.IpAddr
 				}
 				pbft.viewnumber = rfqmsg.ViewList[i]
@@ -978,11 +1050,35 @@ func (pbft *PBFT) generatePubKeys() {
 	if err != nil {
 		log.Fatalln(err)
 	}
-	publicKey := &privateKey.PublicKey
-	pbft.nodePubKey = EncodePublic(publicKey)
+	pbft.nodePrvKey = privateKey
+	pbft.nodePubKey = &privateKey.PublicKey
+	pbft.nodePrvkeystr = EncodePrivate(pbft.nodePrvKey)
+	pbft.nodePubkeystr = EncodePublic(pbft.nodePubKey)
 }
+
 func EncodePublic(publicKey *ecdsa.PublicKey) string {
 	x509EncodedPub, _ := x509.MarshalPKIXPublicKey(publicKey)
 	pemEncodedPub := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: x509EncodedPub})
 	return string(pemEncodedPub)
+}
+
+func EncodePrivate(privateKey *ecdsa.PrivateKey) string {
+	x509Encoded, _ := x509.MarshalECPrivateKey(privateKey)
+	pemEncoded := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: x509Encoded})
+	return string(pemEncoded)
+}
+
+func DecodePrivate(pemEncoded string) *ecdsa.PrivateKey {
+	block, _ := pem.Decode([]byte(pemEncoded))
+	x509Encoded := block.Bytes
+	privateKey, _ := x509.ParseECPrivateKey(x509Encoded)
+	return privateKey
+}
+
+func DecodePublic(pemEncodedPub string) *ecdsa.PublicKey {
+	blockPub, _ := pem.Decode([]byte(pemEncodedPub))
+	x509EncodedPub := blockPub.Bytes
+	genericPublicKey, _ := x509.ParsePKIXPublicKey(x509EncodedPub)
+	publicKey := genericPublicKey.(*ecdsa.PublicKey)
+	return publicKey
 }
