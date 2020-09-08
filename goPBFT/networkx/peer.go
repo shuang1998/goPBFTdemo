@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
-	crand "crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/gob"
@@ -13,12 +12,15 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 )
 
 const protocol = "tcp"
+const dbFile = "blockchain_%s.db"
 const commandLength = 16
 const TotalNumber = 4
 const QuorumSize = 3
@@ -26,6 +28,7 @@ const ConsensusTimer = 5
 const InauguratTimer = 60
 const ScanInterval = 100
 const ThreadExit = 5000
+const BroadTxInterval = 1000
 
 const (
 	stat_consensus = iota
@@ -38,17 +41,22 @@ const (
 )
 
 type persister struct {
-	requestlist map[int]int
+	blockhashlist map[int][32]byte
 	logview map[int]int // height -> view
 	commitedheight int
 	preparedheight int
+	prepareqc PrepareQC
+	commitqc CommitQC
 
+	dbFileName string
 }
 
 type progres struct {
 	view int
 	height int
 }
+
+
 
 type PBFT struct {
 	mu sync.Mutex
@@ -60,6 +68,8 @@ type PBFT struct {
 	nodePrvkeystr string
 	minerIPAddress      []string
 	minerPubKey         []string
+	userAccounts []string
+
 
 	status int
 	consenstatus int
@@ -76,7 +86,12 @@ type PBFT struct {
 
 	viewnumber 		int
 	currentHeight 	int
-	currequest int
+	curblockhash [32]byte
+	curblock *datastruc.Block
+	lastblockhash [32]byte
+
+	pendingTxPool datastruc.TXSet
+	pendingBlockPool []datastruc.Block
 
 	pre_preparelog map[int]PrePrepareMsg
 	newviewlog map[int]NewViewMsg
@@ -88,16 +103,18 @@ type PBFT struct {
 	hasRemainBInNVMsg bool
 	preprepareMsgInNVMsg PrePrepareMsg
 
-
-
 	curConfigure []datastruc.PeerIdentity
 	succLine *datastruc.SuccLine
 
 	recovStartView int
 	recovStartHeight int
 
+
+	coinbaseTxinGeneBlock []datastruc.Transaction
 	persis persister
-	recoverflag bool
+
+	wallet *datastruc.Wallet
+	curUTXOSet datastruc.UTXOSet
 }
 
 func commandToBytes(command string) []byte {
@@ -129,10 +146,14 @@ func MakePeer(addr string, memb []string) *PBFT {
 	pbft.nodeIPAddress = addr
 	pbft.minerIPAddress = memb
 	pbft.minerPubKey = []string{}
+	pbft.userAccounts = []string{}
 
 	pbft.status = stat_consensus
 	pbft.consenstatus = Unstarted
 	pbft.curleaderPubKeystr = ""
+	pbft.curblockhash = [32]byte{}
+	pbft.curblock = &datastruc.Block{}
+	pbft.lastblockhash = [32]byte{}
 
 	pbft.viewnumber = 0
 	pbft.currentHeight = 0
@@ -160,9 +181,26 @@ func MakePeer(addr string, memb []string) *PBFT {
 	pbft.recovStartHeight = 0
 	pbft.persis = persister{}
 	pbft.persis.logview = make(map[int]int)
-	pbft.persis.requestlist = make(map[int]int)
+	pbft.persis.blockhashlist = make(map[int][32]byte)
+	tmp := extractNodeID(addr)
+	dbFile := fmt.Sprintf(dbFile, strconv.Itoa(tmp))
+	pbft.persis.dbFileName = dbFile
+	pbft.persis.prepareqc = PrepareQC{}
+	pbft.persis.commitqc = CommitQC{}
 
-	pbft.generatePubKeys()
+	pbft.coinbaseTxinGeneBlock = []datastruc.Transaction{}
+	pbft.pendingTxPool = datastruc.TXSet{}
+	pbft.pendingBlockPool = []datastruc.Block{}
+
+
+	pbft.wallet = &datastruc.Wallet{}
+	pbft.wallet.Initialize()
+	pbft.curUTXOSet = datastruc.UTXOSet{}
+	pbft.nodePubkeystr = pbft.wallet.MainPubKey
+	pbft.nodePrvkeystr = pbft.wallet.MainPriKey
+	pbft.nodePrvKey = DecodePrivate(pbft.wallet.MainPriKey)
+	pbft.nodePubKey = DecodePublic(pbft.wallet.MainPubKey)
+
 	constructConfigure(&pbft.curConfigure, datastruc.PeerIdentity{pbft.nodePubkeystr, pbft.nodeIPAddress})
 
 	return pbft
@@ -175,8 +213,28 @@ func (pbft *PBFT) Initialize() {
 	// initialization stage, find peer address and pubkey, build genesis block
 	pbft.broadcastAddrPubKeyIp()
 	time.Sleep(time.Second*2)
+	pbft.BroadcastCoinBaseTransaction()
+	time.Sleep(time.Second*4)
+
+	// sort coinbasetxs
+	tmp := pbft.coinbaseTxinGeneBlock
+	pbft.coinbaseTxinGeneBlock = datastruc.SortTxs(tmp)
+	pbft.curUTXOSet.UpdateUtxoSetFromCoinbaseTxs(&pbft.coinbaseTxinGeneBlock)
+	pbft.wallet.UpdateWallet(&pbft.curUTXOSet)
+
+	//fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "initializes a wallet with ", len(pbft.wallet.Utxos.Set), " txs in it")
+	pbft.mu.Lock()
+	genesisb := datastruc.ConstructGenesisBlock(&pbft.coinbaseTxinGeneBlock, pbft.curConfigure)
+	pbft.persis.blockhashlist[0] = genesisb.GetHash()
+	pbft.lastblockhash = genesisb.GetHash()
+	fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "genesis block hash: ", genesisb.GetHash())
+	CreateBlockchainDB(pbft.persis.dbFileName, genesisb)
+	pbft.mu.Unlock()
 
 	time.Sleep(time.Second*2)
+	go pbft.BroadcastTransaction()
+	time.Sleep(time.Second*2)
+	pbft.viewnumber += 1
 	pbft.currentHeight += 1
 	pbft.consenstatus = Unstarted
 	go pbft.run()
@@ -191,10 +249,18 @@ RECOVERSTART:
 			if pbft.nodePubkeystr==pbft.curleaderPubKeystr {
 				time.Sleep(2000*time.Millisecond)
 				if pbft.hasRemainBInNVMsg==false {
-					condi := pbft.currentHeight>=1116 && pbft.currentHeight%8==0 && (pbft.currentHeight/(pbft.viewnumber+1))==8
+					condi := pbft.currentHeight==4 && pbft.viewnumber==1
 					if condi==false {
 						fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "is leader, now broadcasts pre-prepare msg")
-						go pbft.broadcastPreprepare(pbft.viewnumber, pbft.currentHeight, pbft.nodePrvKey)
+						pbft.mu.Lock()
+						bloc := datastruc.NewBlock(pbft.nodePubkeystr, pbft.nodePrvKey, &pbft.pendingTxPool, pbft.viewnumber, pbft.currentHeight, pbft.lastblockhash)
+						pbft.mu.Unlock()
+						blockhash := bloc.GetHash()
+						//tmp := []byte(bloc.Kind + "," + strconv.Itoa(bloc.Height) + "," + string(bloc.PrevHash[:]) + ","  + string(bloc.MerkleTreeHash[:]))
+						//var blockhash [32]byte
+						//datastruc.SingleHash256(&tmp, &blockhash)
+						go pbft.broadcastBlock(&bloc)
+						go pbft.broadcastPreprepare(pbft.viewnumber, pbft.currentHeight, pbft.nodePrvKey, blockhash)
 					} else {
 						fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "is leader, launches silence attack, does not broadcast pre-prepare msg")
 					}
@@ -242,8 +308,8 @@ RECOVERSTART:
 					if prog.view==pbft.viewnumber && prog.height==pbft.currentHeight && pbft.consenstatus==Unstarted {
 						pbft.consenstatus = Preprepared
 						//fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "is pre-prepared in view ", pbft.viewnumber, " height ", pbft.currentHeight)
-						go pbft.broadcastPrepare(pbft.viewnumber, pbft.currentHeight, pbft.currequest)
-						go pbft.scanPrepare(pbft.viewnumber, pbft.currentHeight, pbft.currequest)
+						go pbft.broadcastPrepare(pbft.viewnumber, pbft.currentHeight, pbft.curblockhash)
+						go pbft.scanPrepare(pbft.viewnumber, pbft.currentHeight, pbft.curblockhash)
 					}
 					pbft.mu.Unlock()
 				case prog :=<- pbft.preparedCh:
@@ -252,8 +318,8 @@ RECOVERSTART:
 						pbft.consenstatus = Prepared
 						pbft.persis.preparedheight = pbft.currentHeight
 						fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "is prepared in view ", pbft.viewnumber, " height ", pbft.currentHeight)
-						go pbft.broadcastCommit(pbft.viewnumber, pbft.currentHeight, pbft.currequest)
-						go pbft.scanCommit(pbft.viewnumber, pbft.currentHeight, pbft.currequest)
+						go pbft.broadcastCommit(pbft.viewnumber, pbft.currentHeight, pbft.curblockhash)
+						go pbft.scanCommit(pbft.viewnumber, pbft.currentHeight, pbft.curblockhash)
 					}
 					pbft.mu.Unlock()
 				case prog :=<- pbft.committedCh:
@@ -349,6 +415,102 @@ RECOVERSTART:
 	}
 }
 
+func (pbft *PBFT) BroadcastTransaction() {
+	i := 0
+	for true {
+		pbft.mu.Lock()
+		lenn := len(pbft.userAccounts)
+		x := rand.Intn(lenn)
+		topbuk := pbft.userAccounts[x]
+		ok, newtx := pbft.wallet.NewTransaction(topbuk, 1)
+		if ok {
+			for _, destip := range pbft.minerIPAddress {
+				if destip != pbft.nodeIPAddress {
+					go SendTransaction(newtx, destip)
+				} else {
+					pbft.pendingTxPool.Txs = append(pbft.pendingTxPool.Txs, newtx)
+				}
+			}
+		}
+		pbft.mu.Unlock()
+		if i<10 {
+			time.Sleep(time.Millisecond * BroadTxInterval)
+		} else if i<30 {
+			time.Sleep(time.Millisecond * BroadTxInterval/2)
+		} else {
+			time.Sleep(time.Millisecond*BroadTxInterval/5)
+		}
+		i += 1
+	}
+
+}
+
+func SendTransaction(newTransaction datastruc.Transaction, destip string) {
+	var buff bytes.Buffer
+	gob.Register(elliptic.P256())
+	enc := gob.NewEncoder(&buff)
+	err := enc.Encode(newTransaction)
+	if err != nil {
+		log.Panic(err)
+	}
+	content := buff.Bytes()
+	comman := commandToBytes("transaction")
+	content = append(comman, content...)
+	sendData(content, destip)
+	//fmt.Println("send a tx to", extractNodeID(destip))
+}
+
+func (pbft *PBFT) BroadcastCoinBaseTransaction() {
+	newCoinbaseTx := datastruc.NewCoinbaseTransaction(pbft.nodePubkeystr)
+	var buff bytes.Buffer
+	enc := gob.NewEncoder(&buff)
+	err := enc.Encode(newCoinbaseTx)
+	if err != nil {
+		log.Panic(err)
+	}
+	content := buff.Bytes()
+	comman := commandToBytes("coinbaseTx")
+	content = append(comman, content...)
+	for _, dest := range pbft.minerIPAddress {
+		if dest != pbft.nodeIPAddress {
+			go sendData(content, dest)
+		} else {
+			pbft.mu.Lock()
+			pbft.coinbaseTxinGeneBlock = append(pbft.coinbaseTxinGeneBlock, newCoinbaseTx)
+			//if len(pbft.coinbaseTxinGeneBlock)==4 {
+			//	res := [][32]byte{}
+			//	for i:=0; i<4; i++ {
+			//		res = append(res, pbft.coinbaseTxinGeneBlock[i].GetHash())
+			//	}
+			//	fmt.Println("node", extractNodeID(pbft.nodeIPAddress), " coinbase txs: ", res)
+			//}
+			pbft.mu.Unlock()
+		}
+	}
+}
+
+func (pbft *PBFT) broadcastBlock(bloc *datastruc.Block) {
+	var buff bytes.Buffer
+	enc := gob.NewEncoder(&buff)
+	err := enc.Encode(bloc)
+	if err != nil {
+		log.Panic(err)
+	}
+	content := buff.Bytes()
+	comman := commandToBytes("block")
+	content = append(comman, content...)
+
+	for _, destip := range pbft.minerIPAddress {
+		if destip!=pbft.nodeIPAddress {
+			go sendData(content, destip)
+		} else {
+			pbft.mu.Lock()
+			pbft.pendingBlockPool = append(pbft.pendingBlockPool, *bloc)
+			pbft.mu.Unlock()
+		}
+	}
+}
+
 func (pbft *PBFT) scanViewChange(view int) {
 	timeouter := time.NewTimer(time.Millisecond*ThreadExit)
 	for {
@@ -375,27 +537,47 @@ func (pbft *PBFT) CommitCurConsensOb() {
 	condi := extractNodeID(pbft.nodeIPAddress)==13 && pbft.currentHeight>=5 && pbft.currentHeight<=5 && pbft.nodePubkeystr!=pbft.curleaderPubKeystr
 	if condi==false {
 		// reset consensus variables and channels
-		pbft.persis.requestlist[pbft.currentHeight] = pbft.currequest
+		pbft.curUTXOSet.UpdateUtxoSetFromBlock(pbft.curblock)
+		newtxlist := []datastruc.Transaction{}
+		for _, tx := range pbft.curblock.TransactionList {
+			if !pbft.curblock.IncludeTheTx(&tx) {
+				newtxlist = append(newtxlist, tx)
+			}
+		}
+		pbft.pendingTxPool = datastruc.TXSet{newtxlist}
+		newblocklist := []datastruc.Block{}
+		for _, bloc := range pbft.pendingBlockPool {
+			if !twoHashEqual(bloc.Hash, pbft.curblockhash) {
+				newblocklist = append(newblocklist, bloc)
+			}
+		}
+		pbft.pendingBlockPool = newblocklist
+		commqc := CommitQC{pbft.commitVote[pbft.currentHeight][:QuorumSize]}
+		UpdateBlockchainDBAfterCommit(pbft.persis.dbFileName, pbft.currentHeight, 0, pbft.curblock, &pbft.curUTXOSet, commqc)
+		pbft.lastblockhash = pbft.curblockhash
+		pbft.wallet.UpdateWallet(&pbft.curUTXOSet)
+		fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "has ", len(pbft.wallet.Utxos.Set), " utxos in height ", pbft.currentHeight)
+		pbft.persis.blockhashlist[pbft.currentHeight] = pbft.curblockhash
 		pbft.persis.logview[pbft.currentHeight] = pbft.viewnumber
 		pbft.recovStartView = pbft.viewnumber
 		pbft.recovStartHeight = pbft.currentHeight
+
 		pbft.consenstatus = Unstarted
 		pbft.currentHeight += 1
-		pbft.currequest = 0
+		pbft.curblockhash = [32]byte{}
 	} else {
 		fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "gives up committing in height", pbft.currentHeight)
 	}
 	if pbft.currentHeight%20==0 {
-		var requestlist []int
+		var blockhashlist [][32]byte
 		for i:=0; i<pbft.currentHeight; i++ {
-			requestlist = append(requestlist, pbft.persis.requestlist[i])
+			blockhashlist = append(blockhashlist, pbft.persis.blockhashlist[i])
 		}
-		fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "requests history: ", requestlist)
+		fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "requests history: ", blockhashlist)
 	}
 }
 
 func (pbft *PBFT) resetVariForViewChange() {
-
 	pbft.status = stat_viewchange
 	pbft.viewnumber += 1
 	// consensus status change?
@@ -421,10 +603,18 @@ func (pbft *PBFT) scanPreprepare(view, heigh int, leaderpubkey string) {
 				pbft.mu.Unlock()
 				theview := thepreprepare.View
 				if view==theview && thepreprepare.Pubkey==leaderpubkey {
-					pbft.currequest = thepreprepare.Digest
-					prog := progres{view, heigh}
-					pbft.prepreparedCh<-prog
-					return
+					pbft.mu.Lock()
+					searchres, theblock := hastheBlock(thepreprepare.Digest, &pbft.pendingBlockPool)
+					pbft.mu.Unlock()
+					if searchres {
+						pbft.mu.Lock()
+						pbft.curblockhash = thepreprepare.Digest
+						pbft.curblock = theblock
+						pbft.mu.Unlock()
+						prog := progres{view, heigh}
+						pbft.prepreparedCh<-prog
+						return
+					}
 				}
 			} else {
 				time.Sleep(time.Millisecond*ScanInterval)
@@ -433,7 +623,18 @@ func (pbft *PBFT) scanPreprepare(view, heigh int, leaderpubkey string) {
 	}
 }
 
-func (pbft *PBFT) scanPrepare(view, heigh int, digest int) {
+func hastheBlock(hval [32]byte, bcpool *[]datastruc.Block) (bool, *datastruc.Block) {
+	var pblock *datastruc.Block
+	for _, bloc := range (*bcpool) {
+		if twoHashEqual(hval, bloc.Hash) {
+			pblock = &bloc
+			return true, pblock
+		}
+	}
+	return false, pblock
+}
+
+func (pbft *PBFT) scanPrepare(view, heigh int, digest [32]byte) {
 	timeouter := time.NewTimer(time.Millisecond*ThreadExit)
 	for {
 		select {
@@ -443,12 +644,16 @@ func (pbft *PBFT) scanPrepare(view, heigh int, digest int) {
 			pbft.mu.Lock()
 			acc := 0
 			for _, vote := range pbft.prepareVote[heigh] {
-				if digest==vote.Digest {
+				if twoHashEqual(digest,vote.Digest) {
 					acc += 1
 				}
 			}
 			pbft.mu.Unlock()
 			if acc>=QuorumSize {
+				pbft.mu.Lock()
+				pbft.persis.prepareqc = PrepareQC{pbft.prepareVote[heigh][:QuorumSize]}
+				UpdateBlockchainDBAfterPrepare(pbft.persis.dbFileName, heigh, 0, digest, pbft.persis.prepareqc)
+				pbft.mu.Unlock()
 				prog := progres{view, heigh}
 				pbft.preparedCh<-prog
 				return
@@ -459,7 +664,7 @@ func (pbft *PBFT) scanPrepare(view, heigh int, digest int) {
 	}
 }
 
-func (pbft *PBFT) scanCommit(view, heigh int, digest int) {
+func (pbft *PBFT) scanCommit(view, heigh int, digest [32]byte) {
 	timeouter := time.NewTimer(time.Millisecond*ThreadExit)
 	for {
 		select {
@@ -475,6 +680,9 @@ func (pbft *PBFT) scanCommit(view, heigh int, digest int) {
 			}
 			pbft.mu.Unlock()
 			if acc>=QuorumSize {
+				pbft.mu.Lock()
+				pbft.persis.commitqc = CommitQC{pbft.commitVote[heigh][:QuorumSize]}
+				pbft.mu.Unlock()
 				prog := progres{view, heigh}
 				pbft.committedCh<-prog
 				return
@@ -485,7 +693,7 @@ func (pbft *PBFT) scanCommit(view, heigh int, digest int) {
 	}
 }
 
-func (pbft *PBFT) broadcastPrepare(v, n , digest int) {
+func (pbft *PBFT) broadcastPrepare(v, n int, digest [32]byte) {
 	preparemsg := NewPrepareMsg(v, n, digest, pbft.nodePubkeystr, pbft.nodePrvKey)
 	for _, dest := range pbft.minerIPAddress {
 		if dest == pbft.nodeIPAddress {
@@ -539,6 +747,12 @@ func (pbft *PBFT) runServer() {
 		switch commanType {
 		case "addrpubkey":
 			go pbft.handleAddrPubKey(request[commandLength:])
+		case "coinbaseTx":
+			go pbft.handleCoinbaseTx(request[commandLength:])
+		case "transaction":
+			go pbft.handleTransaction(request[commandLength:])
+		case "block":
+			go pbft.handleBlock(request[commandLength:])
 		case "prepreparemsg":
 			go pbft.handlePreprepareMsg(request[commandLength:])
 		case "preparemsg":
@@ -557,6 +771,54 @@ func (pbft *PBFT) runServer() {
 		case "replylost":
 			go pbft.handleReplyLost(request[commandLength:])
 		}
+	}
+}
+
+func (pbft *PBFT) handleCoinbaseTx(conten []byte) {
+	var buff bytes.Buffer
+	var coinbTx datastruc.Transaction
+	buff.Write(conten)
+
+	dec := gob.NewDecoder(&buff)
+	err := dec.Decode(&coinbTx)
+	if err != nil {
+		log.Panic(err)
+	}
+	if coinbTx.Verify() {
+		pbft.mu.Lock()
+		pbft.coinbaseTxinGeneBlock = append(pbft.coinbaseTxinGeneBlock, coinbTx)
+		//if len(pbft.coinbaseTxinGeneBlock)==4 {
+		//	res := [][32]byte{}
+		//	for i:=0; i<4; i++ {
+		//		res = append(res, pbft.coinbaseTxinGeneBlock[i].GetHash())
+		//	}
+		//	fmt.Println("node", extractNodeID(pbft.nodeIPAddress), " coinbase txs: ", res)
+		//}
+		pbft.mu.Unlock()
+		// may need sort, TODO
+		// already sorted, why?
+	}
+}
+
+func (pbft *PBFT) handleTransaction(conten []byte) {
+	//fmt.Println("node", extractNodeID(pbft.nodeIPAddress), " receives a tx")
+	var buff bytes.Buffer
+	var tx datastruc.Transaction
+	buff.Write(conten)
+
+	gob.Register(elliptic.P256())
+	dec := gob.NewDecoder(&buff)
+	err := dec.Decode(&tx)
+	if err != nil {
+		log.Panic(err)
+	}
+	if tx.Verify() {
+		pbft.mu.Lock()
+		pbft.pendingTxPool.Txs = append(pbft.pendingTxPool.Txs, tx)
+		for _, out := range tx.Vout {
+			pbft.userAccounts = append(pbft.userAccounts, out.PubKey)
+		}
+		pbft.mu.Unlock()
 	}
 }
 
@@ -594,18 +856,43 @@ func (pbft *PBFT) handleAddrPubKey(conten []byte) {
 	}
 	pbft.mu.Lock()
 	constructConfigure(&pbft.curConfigure, peerid)
-	pbft.mu.Unlock()
-
+	pbft.userAccounts = append(pbft.userAccounts, peerid.PubKey)
 	if len(pbft.curConfigure)==TotalNumber {
 		pbft.succLine = datastruc.ConstructSuccessionLine(pbft.curConfigure)
 		pbft.curleaderPubKeystr = pbft.succLine.CurLeader.Member.PubKey
 		pbft.curleaderIpAddr = pbft.succLine.CurLeader.Member.IpAddr
 		fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "thinks the current leader should be ", pbft.curleaderIpAddr)
 	}
+	pbft.mu.Unlock()
 }
 
-func (pbft *PBFT) broadcastPreprepare(v, n int, prk *ecdsa.PrivateKey) {
-	prepreparemsg := NewPreprepareMsg(v, n, pbft.nodePubkeystr, prk)
+func (pbft *PBFT) handleBlock(content []byte) {
+	var buff bytes.Buffer
+	var bloc datastruc.Block
+	buff.Write(content)
+	dec := gob.NewDecoder(&buff)
+	err := dec.Decode(&bloc)
+	if err != nil {
+		fmt.Println("decoding error")
+	}
+
+	// verify block
+	pubkey := DecodePublic(bloc.PubKey)
+	if !bloc.Sig.Verify(bloc.Hash[:], pubkey) {
+		fmt.Println("the block signature is wrong!")
+		return
+	}
+
+
+	pbft.mu.Lock()
+	pbft.pendingBlockPool = append(pbft.pendingBlockPool, bloc)
+	pbft.mu.Unlock()
+
+	fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "received a block with ", len(bloc.TransactionList), "txs in it")
+}
+
+func (pbft *PBFT) broadcastPreprepare(v, n int, prk *ecdsa.PrivateKey, hashval [32]byte) {
+	prepreparemsg := NewPreprepareMsg(v, n, pbft.nodePubkeystr, prk, hashval)
 	var buff bytes.Buffer
 	enc := gob.NewEncoder(&buff)
 	err := enc.Encode(prepreparemsg)
@@ -656,7 +943,7 @@ func (pbft *PBFT) handlePreprepareMsg(content []byte) {
 	}
 
 	// verify signature
-	datatoverify := string(prepreparemsg.View) + "," + string(prepreparemsg.Order) + "," + string(prepreparemsg.Digest)
+	datatoverify := string(prepreparemsg.View) + "," + string(prepreparemsg.Order) + "," + string(prepreparemsg.Digest[:])
 	pub := DecodePublic(prepreparemsg.Pubkey)
 	if !prepreparemsg.Sig.Verify([]byte(datatoverify), pub) {
 		fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "received pre-preparemsg in height ", prepreparemsg.Order, " but the sig is wrong!")
@@ -708,7 +995,7 @@ func (pbft *PBFT) handlePrepareMsg(content []byte) {
 		log.Panic(err)
 	}
 
-	datatoverify := string(preparemsg.View) + "," + string(preparemsg.Order) + "," + string(preparemsg.Digest)
+	datatoverify := string(preparemsg.View) + "," + string(preparemsg.Order) + "," + string(preparemsg.Digest[:])
 	pub := DecodePublic(preparemsg.Pubkey)
 	if !preparemsg.Sig.Verify([]byte(datatoverify), pub) {
 		fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "received preparemsg in height ", preparemsg.Order, " but the sig is wrong!")
@@ -720,7 +1007,7 @@ func (pbft *PBFT) handlePrepareMsg(content []byte) {
 	pbft.mu.Unlock()
 }
 
-func (pbft *PBFT) broadcastCommit(v, n int, digest int) {
+func (pbft *PBFT) broadcastCommit(v, n int, digest [32]byte) {
 	commitmsg := NewCommitMsg(v, n, digest, pbft.nodePubkeystr, pbft.nodePrvKey)
 	for _, dest := range pbft.minerIPAddress {
 		if dest == pbft.nodeIPAddress {
@@ -754,7 +1041,7 @@ func (pbft *PBFT) handleCommitMsg(content []byte) {
 		fmt.Println("decoding error")
 	}
 
-	datatoverify := string(commitmsg.View) + "," + string(commitmsg.Order) + "," + string(commitmsg.Digest)
+	datatoverify := string(commitmsg.View) + "," + string(commitmsg.Order) + "," + string(commitmsg.Digest[:])
 	pub := DecodePublic(commitmsg.Pubkey)
 	if !commitmsg.Sig.Verify([]byte(datatoverify), pub) {
 		fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "received commitmsg in height ", commitmsg.Order, " but the sig is wrong!")
@@ -904,13 +1191,13 @@ func (pbft *PBFT) handleQueryLost(content []byte) {
 		remotepubkey := qlmsg.Pubkey
 		remoteaddr := ExtractSenderIp(pbft.curConfigure, remotepubkey)
 		viewlist := []int{}
-		requestlist := []int{}
+		blockhashlist := [][32]byte{}
 		for i:=qlmsg.Localheight+1; i<=localheigh; i++ {
 			viewlist = append(viewlist, pbft.persis.logview[i])
-			requestlist = append(requestlist, pbft.persis.requestlist[i])
+			blockhashlist = append(blockhashlist, pbft.persis.blockhashlist[i])
 		}
 		fmt.Println("------", viewlist, "------")
-		go ReplyLost(pbft.nodePubkeystr, localheigh, qlmsg.Localheight, remoteaddr, viewlist, requestlist, pbft.nodePrvKey)
+		go ReplyLost(pbft.nodePubkeystr, localheigh, qlmsg.Localheight, remoteaddr, viewlist, blockhashlist, pbft.nodePrvKey)
 	} else {
 		fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "doesn't reply querier because it is also left behind")
 	}
@@ -971,7 +1258,7 @@ func (pbft *PBFT) handleReplyLost(content []byte) {
 			pbft.persis.preparedheight = order
 			pbft.persis.commitedheight = order
 			pbft.persis.logview[order] = pbft.viewnumber
-			pbft.persis.requestlist[order] = rfqmsg.RequestList[i]
+			pbft.persis.blockhashlist[order] = rfqmsg.BlockHashList[i]
 			fmt.Println("node", extractNodeID(pbft.nodeIPAddress), "recovers the request in height", order)
 			pbft.recovStartHeight += 1
 		}
@@ -1039,22 +1326,15 @@ func constructConfigure(config *[]datastruc.PeerIdentity, peerid datastruc.PeerI
 	}
 }
 
+
+
+
 func extractNodeID(s string) int {
 	pos := len(s) - 1
 	res := int([]byte(s)[pos]) - 48
 	return res
 }
 
-func (pbft *PBFT) generatePubKeys() {
-	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), crand.Reader)
-	if err != nil {
-		log.Fatalln(err)
-	}
-	pbft.nodePrvKey = privateKey
-	pbft.nodePubKey = &privateKey.PublicKey
-	pbft.nodePrvkeystr = EncodePrivate(pbft.nodePrvKey)
-	pbft.nodePubkeystr = EncodePublic(pbft.nodePubKey)
-}
 
 func EncodePublic(publicKey *ecdsa.PublicKey) string {
 	x509EncodedPub, _ := x509.MarshalPKIXPublicKey(publicKey)
@@ -1081,4 +1361,13 @@ func DecodePublic(pemEncodedPub string) *ecdsa.PublicKey {
 	genericPublicKey, _ := x509.ParsePKIXPublicKey(x509EncodedPub)
 	publicKey := genericPublicKey.(*ecdsa.PublicKey)
 	return publicKey
+}
+
+func twoHashEqual(a [32]byte, b [32]byte) bool {
+	for i:=0; i<32; i++ {
+		if a[i]!=b[i] {
+			return false
+		}
+	}
+	return true
 }

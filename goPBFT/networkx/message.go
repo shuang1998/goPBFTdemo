@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"log"
 	"math/big"
-	mrand "math/rand"
 )
 
 type PariSign struct {
@@ -21,7 +20,7 @@ type PariSign struct {
 type PrePrepareMsg struct {
 	View int
 	Order int
-	Digest int
+	Digest [32]byte
 	Pubkey string
 	Sig PariSign
 }
@@ -29,7 +28,7 @@ type PrePrepareMsg struct {
 type PrepareMsg struct {
 	View int
 	Order int
-	Digest int
+	Digest [32]byte
 	Pubkey string
 	Sig PariSign
 }
@@ -37,7 +36,7 @@ type PrepareMsg struct {
 type CommitMsg struct {
 	View int
 	Order int
-	Digest int
+	Digest [32]byte
 	Pubkey string
 	Sig PariSign
 }
@@ -73,37 +72,37 @@ type CommitQC struct {
 	CommitMsgSet []CommitMsg
 }
 
-func NewPreprepareMsg(view int, order int, pubkeystr string, prvkey *ecdsa.PrivateKey) PrePrepareMsg {
+func NewPreprepareMsg(view int, order int, pubkeystr string, prvkey *ecdsa.PrivateKey, hashval [32]byte) PrePrepareMsg {
 	prepreparemsg := PrePrepareMsg{}
 	prepreparemsg.View = view
 	prepreparemsg.Order = order
-	prepreparemsg.Digest = mrand.Intn(1000)
+	prepreparemsg.Digest = hashval
 
-	datatosign := string(prepreparemsg.View) + "," + string(prepreparemsg.Order) + "," + string(prepreparemsg.Digest)
+	datatosign := string(prepreparemsg.View) + "," + string(prepreparemsg.Order) + "," + string(hashval[:])
 	prepreparemsg.Sig.Sign([]byte(datatosign), prvkey)
 	prepreparemsg.Pubkey = pubkeystr
 	return prepreparemsg
 }
 
-func NewPrepareMsg(view int, order int, digest int, pubkeystr string, prvkey *ecdsa.PrivateKey) PrepareMsg {
+func NewPrepareMsg(view int, order int, digest [32]byte, pubkeystr string, prvkey *ecdsa.PrivateKey) PrepareMsg {
 	preparemsg := PrepareMsg{}
 	preparemsg.View = view
 	preparemsg.Order = order
 	preparemsg.Digest = digest
 
-	datatosign := string(preparemsg.View) + "," + string(preparemsg.Order) + "," + string(preparemsg.Digest)
+	datatosign := string(preparemsg.View) + "," + string(preparemsg.Order) + "," + string(preparemsg.Digest[:])
 	preparemsg.Sig.Sign([]byte(datatosign), prvkey)
 	preparemsg.Pubkey = pubkeystr
 	return preparemsg
 }
 
-func NewCommitMsg(view int, order int, digest int, pubkeystr string, prvkey *ecdsa.PrivateKey) CommitMsg {
+func NewCommitMsg(view int, order int, digest [32]byte, pubkeystr string, prvkey *ecdsa.PrivateKey) CommitMsg {
 	commitmsg := CommitMsg{}
 	commitmsg.View = view
 	commitmsg.Order = order
 	commitmsg.Digest = digest
 
-	datatosign := string(commitmsg.View) + "," + string(commitmsg.Order) + "," + string(commitmsg.Digest)
+	datatosign := string(commitmsg.View) + "," + string(commitmsg.Order) + "," + string(commitmsg.Digest[:])
 	commitmsg.Sig.Sign([]byte(datatosign), prvkey)
 	commitmsg.Pubkey = pubkeystr
 	return commitmsg
